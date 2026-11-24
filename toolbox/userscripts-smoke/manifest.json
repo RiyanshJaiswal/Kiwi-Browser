@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Kiwi User Scripts Smoke Test",
+  "version": "1.0.0",
+  "description": "Tests userScripts on example.com only.",
+  "permissions": [
+    "userScripts"
+  ],
+  "host_permissions": [
+    "https://example.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  }
+}
