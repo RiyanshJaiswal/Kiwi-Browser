@@ -1,0 +1,56 @@
+name: Kiwi APK diagnostics
+on:
+  push:
+    branches: [fix/tampermonkey-userscripts]
+    paths:
+      - '.github/workflows/kiwi-apk-diagnostics.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download pinned official ARM64 release
+        run: |
+          curl --fail --location --retry 3 --output kiwi.apk 'https://github.com/kiwibrowser/src.next/releases/download/14310011181/com.kiwibrowser.browser-arm64-14310011181-github.apk'
+          test "$(stat -c %s kiwi.apk)" = 244256017
+          sha256sum kiwi.apk
+      - name: Check archive integrity and API markers
+        run: |
+          python3 - <<'PY'
+          import zipfile
+          markers = [b'userScripts', b'userScripts.register', b'userScripts.getScripts', b'allowUserScripts', b'Allow User Scripts', b'user_scripts', b'UserScriptsAPI']
+          with zipfile.ZipFile('kiwi.apk') as apk:
+              bad = apk.testzip()
+              if bad is not None:
+                  raise SystemExit('CRC failure: ' + bad)
+              print('ZIP integrity PASS')
+              print('Archive entries:', len(apk.infolist()))
+              libs = [i for i in apk.infolist() if i.filename.endswith('.so')]
+              assert any(i.filename.startswith('lib/arm64-v8a/') for i in libs), 'ARM64 library missing'
+              for i in libs:
+                  print('Native library:', i.filename, i.file_size)
+              for i in apk.infolist():
+                  if not i.filename.endswith(('.so', '.pak', '.dex', '.js', '.json', '.bin', '.arsc')):
+                      continue
+                  found = set()
+                  tail = b''
+                  with apk.open(i) as f:
+                      while chunk := f.read(4 * 1024 * 1024):
+                          block = tail + chunk
+                          found.update(m for m in markers if m in block or m.decode().encode('utf-16le') in block)
+                          tail = block[-128:]
+                  if found:
+                      print(i.filename, ':', ', '.join(sorted(m.decode() for m in found)))
+              print('Marker scan is heuristic; absence does not establish missing API, and presence does not establish functionality.')
+          PY
+      - name: Verify APK signature and manifest
+        run: |
+          sdk="${ANDROID_HOME:?Android SDK missing}"
+          apksigner=$(find "$sdk/build-tools" -name apksigner -type f | sort -V | tail -1)
+          aapt=$(find "$sdk/build-tools" -name aapt -type f | sort -V | tail -1)
+          test -n "$apksigner" && test -n "$aapt"
+          "$apksigner" verify --verbose --print-certs kiwi.apk
+          "$aapt" dump badging kiwi.apk | head -20
