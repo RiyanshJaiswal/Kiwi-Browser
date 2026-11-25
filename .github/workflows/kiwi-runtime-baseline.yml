@@ -1,0 +1,100 @@
+name: Kiwi Android runtime baseline
+on:
+  push:
+    branches: [fix/tampermonkey-userscripts]
+    paths: ['.github/workflows/kiwi-runtime-baseline.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download official x86_64 APK
+        run: |
+          curl --fail --location --retry 3 -o kiwi.apk 'https://github.com/kiwibrowser/src.next/releases/download/14310011181/com.kiwibrowser.browser-x64-14310011181-github.apk'
+          test "$(stat -c %s kiwi.apk)" = 246183877
+          mkdir -p diagnostics
+      - name: Enable KVM on disposable runner
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Run official browser in Android emulator
+        uses: ReactiveCircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 30
+          arch: x86_64
+          target: google_apis
+          profile: pixel_2
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot
+          disable-animations: true
+          script: |
+            adb install -t kiwi.apk
+            adb shell pm path com.kiwibrowser.browser
+            adb shell am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p com.kiwibrowser.browser
+            sleep 6
+            adb shell pidof com.kiwibrowser.browser
+            adb shell dumpsys activity activities > diagnostics/activity.txt
+            adb shell uiautomator dump /sdcard/kiwi-initial.xml || true
+            adb pull /sdcard/kiwi-initial.xml diagnostics/initial.xml || true
+            adb exec-out screencap -p > diagnostics/initial.png
+            python3 - <<'PY'
+            import re, subprocess, time, xml.etree.ElementTree as ET
+            from pathlib import Path
+            def adb(*args, check=True):
+                return subprocess.run(['adb', *args], check=check, capture_output=True, text=True).stdout
+            def dump(name):
+                adb('shell','uiautomator','dump','/sdcard/kiwi.xml',check=False)
+                xml=adb('shell','cat','/sdcard/kiwi.xml',check=False)
+                Path('diagnostics', name+'.xml').write_text(xml)
+                try: return list(ET.fromstring(xml).iter('node'))
+                except ET.ParseError: return []
+            def tap(node):
+                xy=list(map(int,re.findall(r'\d+',node.get('bounds',''))))
+                if len(xy)!=4: return False
+                adb('shell','input','tap',str((xy[0]+xy[2])//2),str((xy[1]+xy[3])//2))
+                time.sleep(2)
+                return True
+            def label(n):
+                return (n.get('text','')+' '+n.get('content-desc','')).strip().lower()
+            for i in range(6):
+                nodes=dump('startup-'+str(i))
+                candidate=next((n for n in nodes if label(n) in ('accept & continue','accept and continue','continue','no thanks','not now','skip','got it','use without an account')),None)
+                if candidate is None or not tap(candidate): break
+            adb('shell','am','start','-W','-a','android.intent.action.VIEW','-d','https://example.com/','-p','com.kiwibrowser.browser',check=False)
+            time.sleep(5)
+            nodes=dump('website')
+            bar=next((n for n in nodes if n.get('resource-id','').endswith((':id/url_bar',':id/search_box_text'))),None)
+            if bar is not None and tap(bar):
+                adb('shell','input','keyevent','KEYCODE_MOVE_END')
+                adb('shell','input','keyevent','--longpress','KEYCODE_DEL',check=False)
+                # Address bar normally selects its existing URL when focused.
+                adb('shell','input','keyevent','KEYCODE_CTRL_LEFT',check=False)
+                adb('shell','input','keycombination','113','29',check=False)
+                adb('shell','input','text','chrome://extensions/')
+                adb('shell','input','keyevent','66')
+            else:
+                adb('shell','am','start','-W','-a','android.intent.action.VIEW','-d','chrome://extensions/','-p','com.kiwibrowser.browser',check=False)
+            time.sleep(5)
+            nodes=dump('extensions')
+            labels=[label(n) for n in nodes if label(n)]
+            print('Visible UI labels:',labels)
+            print('Developer mode visible:',any('developer mode' in s for s in labels))
+            print('Allow user scripts visible:',any('allow user scripts' in s for s in labels))
+            print('UI labels alone cannot establish API availability.')
+            PY
+            adb exec-out screencap -p > diagnostics/extensions.png
+            adb shell cat /proc/net/unix > diagnostics/unix-sockets.txt || true
+            adb logcat -d -t 3000 > diagnostics/logcat.txt
+            adb shell pidof com.kiwibrowser.browser
+            echo 'Install and browser process smoke test passed. Extension permissions and actual script injection not yet verified.'
+      - name: Upload runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kiwi-runtime-evidence
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
